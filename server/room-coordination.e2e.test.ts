@@ -94,6 +94,43 @@ it("does not let a Chief's grant expose a foreign room transcript to its special
   expect(await f.messages(f.destination.activeTaskId)).toEqual([]);
 }), 45_000);
 
+it("allows a specialist room to use an explicit Chief-supervised bridge", () => withRooms(async f => {
+  const supervisor = (await f.cli("new-bot", "--name", "Chief")).bot;
+  await f.api(`/api/bots/${supervisor.id}`, {
+    chiefOfStaff: true,
+    managedSections: ["A"],
+    acknowledgePeerScope: true,
+  }, "PATCH");
+  const configured = await f.api(`/api/groups/${f.destination.id}`, {
+    memberIds: [f.sender.id, f.target.id, supervisor.id],
+    coordinationMode: "chief-supervised",
+    supervisorBotId: supervisor.id,
+  }, "PATCH");
+  expect(configured.group).toMatchObject({
+    coordinationMode: "chief-supervised",
+    supervisorBotId: supervisor.id,
+  });
+  await f.start();
+  expect((await f.wait()).status).toBe("settled");
+  expect(f.nodes().find((node: any) => node.botId === f.target.id)?.status).toBe("completed");
+  expect((await f.messages(f.destination.activeTaskId)).some((message: any) => message.text?.includes("Please build CSV"))).toBe(true);
+}), 45_000);
+
+it("rejects a supervised room with multiple specialist sections", () => withRooms(async f => {
+  const supervisor = (await f.cli("new-bot", "--name", "Chief")).bot;
+  const other = (await f.cli("new-bot", "--name", "Other", "--section", "B")).bot;
+  await f.api(`/api/bots/${supervisor.id}`, {
+    chiefOfStaff: true,
+    managedSections: ["A", "B"],
+    acknowledgePeerScope: true,
+  }, "PATCH");
+  await expect(f.api(`/api/groups/${f.destination.id}`, {
+    memberIds: [f.sender.id, f.target.id, other.id, supervisor.id],
+    coordinationMode: "chief-supervised",
+    supervisorBotId: supervisor.id,
+  }, "PATCH")).rejects.toThrow("exactly one non-empty specialist section");
+}), 45_000);
+
 it("withholds a cross-team result if the owner revokes access while it runs", () => withRooms(async f => {
   await f.api(`/api/bots/${f.target.id}`, { section: "Engineering" }, "PATCH");
   await f.api(`/api/bots/${f.sender.id}`, { chiefOfStaff: true, managedSections: ["Engineering"], acknowledgePeerScope: true }, "PATCH");

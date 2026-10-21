@@ -14,6 +14,7 @@ import { isRemoteMcpServer, parseStoredMcpServer } from "./mcp-registry.ts";
 import { parseJson, schemaIssue, type JsonObject, type JsonValue } from "./schema.ts";
 
 const optionalText = z.string().optional();
+const approvalModeSchema = z.enum(["ask", "edits", "auto", "full"]);
 const SSH_ALIAS = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
 const LEGACY_BROWSER_PROFILE_ID = /^[A-Za-z0-9_-]{1,40}$/;
 const BROWSER_PROFILE_ID = /^[a-z0-9_-]{1,40}$/;
@@ -364,6 +365,9 @@ const appConfigSchema = z.object({
   }).optional(),
   /** Non-secret profile details shown in the sidebar. */
   profile: z.object({ name: optionalText, email: optionalText }).optional(),
+  /** Server-wide default for new work. Existing explicit bot overrides are
+   * preserved unless an administrator explicitly applies the setting. */
+  approvalDefaults: z.object({ mode: approvalModeSchema }).strict().optional(),
   /** UI language override (BCP-47, lowercase). Empty/absent = follow the
    * system language. Unknown tags degrade to English in the renderer. */
   language: optionalText,
@@ -388,7 +392,10 @@ const appConfigSchema = z.object({
 const storedAppConfigSchema = appConfigSchema.extend({
   browserProfiles: storedBrowserProfilesSchema.optional(),
 });
-const appConfigPatchSchema = appConfigSchema.omit({ instances: true, mcpServers: true, cliStartup: true, customDomain: true });
+// Approval defaults have a dedicated admin-only route because changing them
+// can rewrite every bot and thread. They remain valid for internal
+// saveConfig() calls, but cannot be changed through the broad config PATCH.
+const appConfigPatchSchema = appConfigSchema.omit({ instances: true, mcpServers: true, cliStartup: true, customDomain: true, approvalDefaults: true });
 const jsonObjectSchema = z.record(z.string(), z.json());
 
 export interface AppConfig {
@@ -396,6 +403,8 @@ export interface AppConfig {
   signIn?: { admins?: string[]; members?: string[] };
   /** Preferred selection for newly created bots; existing bots keep theirs. */
   defaultModelSelection?: ModelSelection;
+  /** Server-wide approval default for new and explicitly inherited work. */
+  approvalDefaults?: { mode: "ask" | "edits" | "auto" | "full" };
   cliStartup?: {
     access: "local" | "tunnel" | "tailscale" | "public-url";
     publicUrl?: string;
@@ -827,7 +836,7 @@ export function saveConfig(patch: Partial<AppConfig>, options: { replaceInstance
   // back after we have successfully recognized the legacy list.
   const storedProfiles = storedBrowserProfilesSchema.safeParse(disk.browserProfiles);
   if (storedProfiles.success) disk.browserProfiles = storedProfiles.data;
-  for (const key of ["xai", "anthropic", "openaiCompat", "composio", "box", "opencodeGo", "tts", "imageGen", "profile", "rooms", "threads", "localVm", "features", "budgets", "billing", "onboarding"] as const) {
+  for (const key of ["xai", "anthropic", "openaiCompat", "composio", "box", "opencodeGo", "tts", "imageGen", "profile", "rooms", "threads", "localVm", "features", "budgets", "billing", "onboarding", "approvalDefaults"] as const) {
     const section = checkedPatch[key];
     if (!section) continue;
     const current = jsonObjectSchema.safeParse(disk[key]);

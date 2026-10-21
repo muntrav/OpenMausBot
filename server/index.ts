@@ -229,6 +229,7 @@ import {
   sectionKey,
   Store,
   type BotRecord,
+  type GroupCoordinationMode,
   type GroupDefaultResponder,
   type GroupRecord,
   type Message,
@@ -386,6 +387,7 @@ import {
   isTurnEventQuarantined,
 } from "./turn-dispatch-guard.ts";
 import { createGracefulShutdown } from "./graceful-shutdown.ts";
+import { appendApprovalDefaultAudit } from "./approval-defaults.ts";
 import { acquireDataDirLeaseForProcess } from "./data-dir-lease.ts";
 import { createWorkspaceAccess, describeEdition, editionStatus, hostedWorkspaceConfiguration, hostedWorkspaceConfigured, loadEnterpriseLayer, type WorkspaceAccess } from "./enterprise.ts";
 import { environmentDescriptor, loadEnvironmentId, serverVersion } from "./environment.ts";
@@ -488,6 +490,15 @@ const SESSION_COOKIE = sessionCookieName(PORT, ENVIRONMENT_ID);
 const HOSTED_WORKSPACE = hostedWorkspaceConfigured();
 let workspaceAccess: WorkspaceAccess | null = null;
 const DESKTOP_MANAGED = process.env.OMB_DESKTOP_PARENT === "1";
+// A self-hosted operator may explicitly opt in to Full access for paired
+// administrator sessions. This is deliberately separate from the desktop
+// capability: it never grants Custom policies and it does not alter the
+// container boundary (Docker socket, host mounts, and privileged mode remain
+// deployment concerns, not agent permissions).
+const REMOTE_FULL_ACCESS = process.env.OMB_ALLOW_REMOTE_FULL_ACCESS === "1";
+function remoteFullAccessAllowed(auth: RequestAuth): boolean {
+  return REMOTE_FULL_ACCESS && auth.scopes.includes("admin");
+}
 // Empty is deliberately a deny-all bootstrap state. Only Electron's private
 // utility-process port can replace it with the per-launch owner capability.
 let desktopMutationToken: string | undefined = DESKTOP_MANAGED ? "" : undefined;
@@ -1393,7 +1404,8 @@ function askBotAndWait(targetBotId: string, message: string, depth: number, from
   });
 }
 
-// New bots honor setup's saved choice; unconfigured workspaces prefer Claude.
+// New bots honor setup's saved choice; otherwise use the shared Luna/high
+// default when the Codex catalog is available.
 async function defaultSelection() {
   return selectDefaultModelSelection(await registry.describe(), cfg.defaultModelSelection);
 }
@@ -1570,6 +1582,24 @@ function checkedGroupResponder(value: unknown, memberIds: string[]): GroupDefaul
   return null;
 }
 
+/** A Chief can remain a passive room member in an ordinary section-only room,
+ * but must not become its implicit human-message responder. Keep an explicit
+ * Chief-supervised room's named supervisor eligible; otherwise prefer the
+ * first active specialist and fall back to mentions for Chief-only rooms. */
+function normalizeRoomResponderForPolicy(
+  responder: GroupDefaultResponder,
+  memberIds: string[],
+  coordinationMode: GroupCoordinationMode = "section",
+): GroupDefaultResponder {
+  if (coordinationMode !== "section" || responder.kind !== "member") return responder;
+  const selected = store.bot(responder.botId);
+  if (!selected?.chiefOfStaff) return responder;
+  const specialist = memberIds
+    .map((id) => store.bot(id))
+    .find((bot) => bot && !bot.hidden && !bot.chiefOfStaff);
+  return specialist ? { kind: "member", botId: specialist.id } : { kind: "mentions" };
+}
+
 function checkedMemberIds(value: unknown): { ok: true; memberIds: string[] } | { ok: false; error: string } {
   if (!Array.isArray(value)) return { ok: false, error: "memberIds must be a list of bot IDs" };
   const invalidIndex = value.findIndex(
@@ -1591,8 +1621,47 @@ function checkedMemberIds(value: unknown): { ok: true; memberIds: string[] } | {
   }
   return { ok: true, memberIds };
 }
+
+function checkedRoomCoordination(
+  mode: unknown,
+  supervisorBotId: unknown,
+  memberIds: string[],
+  roomSection?: string,
+): { ok: true; mode: GroupCoordinationMode; supervisorBotId?: string } | { ok: false; error: string } {
+  const selectedMode = mode === undefined ? "section" : mode;
+  if (selectedMode !== "section" && selectedMode !== "chief-supervised") {
+    return { ok: false, error: "coordinationMode must be section or chief-supervised" };
+  }
+  if (selectedMode === "section") {
+    if (supervisorBotId !== undefined && supervisorBotId !== null && supervisorBotId !== "") {
+      return { ok: false, error: "section-only rooms cannot have a Chief supervisor" };
+    }
+    return { ok: true, mode: "section" };
+  }
+  if (typeof supervisorBotId !== "string" || !supervisorBotId || !memberIds.includes(supervisorBotId)) {
+    return { ok: false, error: "chief-supervised rooms need a supervisorBotId naming a room member" };
+  }
+  const supervisor = store.bot(supervisorBotId);
+  if (!supervisor || supervisor.hidden || !supervisor.chiefOfStaff) {
+    return { ok: false, error: "the room supervisor must be an active Chief of Staff" };
+  }
+  const specialistSections = [...new Set(memberIds
+    .filter((id) => id !== supervisorBotId)
+    .map((id) => sectionKey(store.bot(id)?.section)))];
+  if (specialistSections.length !== 1 || !specialistSections[0]) {
+    return { ok: false, error: "chief-supervised rooms need exactly one non-empty specialist section besides the supervisor" };
+  }
+  const specialistSection = specialistSections[0]!;
+  if (roomSection && sectionKey(roomSection) && sectionKey(roomSection) !== specialistSection) {
+    return { ok: false, error: "the room section must match its specialist section" };
+  }
+  if (!canAccessTeam(supervisor, specialistSection)) {
+    return { ok: false, error: `@${supervisor.name} does not manage the ${peerName(specialistSection)} section` };
+  }
+  return { ok: true, mode: "chief-supervised", supervisorBotId };
+}
 let bootSelection = { instanceId: "", model: "" };
-const store = new Store(() => bootSelection);
+const store = new Store(() => bootSelection, () => cfg.approvalDefaults?.mode ?? "ask");
 const teamComputers = new TeamComputers(join(DATA_DIR, "team-computers.json"), ENVIRONMENT_ID);
 let followupsReady = false;
 const sendSequencer = new SendSequencer();
@@ -1683,6 +1752,7 @@ function previewSystemPrompt(bot: BotRecord) {
     : peers.length > 0
       ? peerRosterSystemPrompt(peers)
       : "";
+  const leadRooms = teamLeadRoomNames(bot.id);
   // Same gate a real turn applies: the block only goes to a bot whose
   // engine actually mounts agent tools, since it names propose_profile,
   // propose_routine and request_credential.
@@ -1715,6 +1785,7 @@ function previewSystemPrompt(bot: BotRecord) {
     }, { note: previewPlan.note }) },
     { id: "composio", label: "Connected apps", text: caps?.composioMcp && bot.composio !== false && composio.configured(cfg) ? COMPOSIO_PROMPT : "" },
     { id: "mcp", label: "MCP servers", text: caps?.customMcp ? customMcpPrompt(Object.keys(customMcpServers(cfg, bot.mcpServers))) : "" },
+    { id: "team-collaboration", label: "Team collaboration", text: `${TEAM_MENTION_POLICY}${leadRooms.length ? `\n${TEAM_LEAD_POLICY} Current lead rooms: ${leadRooms.join(", ")}.` : ""}` },
     { id: "browser", label: "Browser", text: previewPlan.browser ? BUILT_IN_BROWSER_SYSTEM_PROMPT : "" },
     { id: "coordination", label: "Team", text: agentsMounted && coordination ? ` ${coordination}` : "" },
     { id: "credential", label: "Credentials", text: agentsMounted ? CREDENTIAL_PROMPT : "" },
@@ -2342,7 +2413,24 @@ function createChannel(value: unknown): GroupRecord {
     if (!responder) throw Object.assign(new Error("invalid setup.defaultResponder"), { status: 400 });
     setup = { bulletin: requested.bulletin, defaultResponder: responder, completed: true };
   }
-  return store.createGroup(name, memberIds, false, section, setup);
+  const coordination = checkedRoomCoordination(
+    body.coordinationMode,
+    body.supervisorBotId,
+    memberIds,
+    section,
+  );
+  if (!coordination.ok) throw Object.assign(new Error(coordination.error), { status: 400 });
+  if (setup) {
+    setup.defaultResponder = normalizeRoomResponderForPolicy(setup.defaultResponder, memberIds, coordination.mode);
+  }
+  const created = store.createGroup(name, memberIds, false, section, setup);
+  if (coordination.mode === "chief-supervised") {
+    return store.patchGroup(created.id, {
+      coordinationMode: coordination.mode,
+      supervisorBotId: coordination.supervisorBotId,
+    }) ?? created;
+  }
+  return created;
 }
 
 function updateChannel(groupId: string, value: unknown): GroupRecord {
@@ -2439,6 +2527,36 @@ function updateChannel(groupId: string, value: unknown): GroupRecord {
       else patch.section = trimmed;
     }
   }
+  const coordinationChanged =
+    body.coordinationMode !== undefined ||
+    body.supervisorBotId !== undefined ||
+    body.memberIds !== undefined ||
+    body.section !== undefined ||
+    body.defaultResponder !== undefined;
+  if (coordinationChanged && !existing.dm) {
+    const requestedMode = body.coordinationMode !== undefined
+      ? body.coordinationMode
+      : roomCoordinationMode(existing);
+    const requestedSupervisor = body.supervisorBotId !== undefined
+      ? body.supervisorBotId
+      : requestedMode === "section"
+        ? undefined
+        : existing.supervisorBotId;
+    const checked = checkedRoomCoordination(
+      requestedMode,
+      requestedSupervisor,
+      (patch.memberIds as string[] | undefined) ?? existing.memberIds,
+      (patch.section as string | undefined) ?? existing.section,
+    );
+    if (!checked.ok) throw Object.assign(new Error(checked.error), { status: 400 });
+    patch.coordinationMode = checked.mode === "section" ? undefined : checked.mode;
+    patch.supervisorBotId = checked.supervisorBotId;
+    patch.defaultResponder = normalizeRoomResponderForPolicy(
+      (patch.defaultResponder as GroupDefaultResponder | undefined) ?? existing.defaultResponder,
+      (patch.memberIds as string[] | undefined) ?? existing.memberIds,
+      checked.mode,
+    );
+  }
   const group = store.patchGroup(groupId, patch);
   if (!group) throw Object.assign(new Error("no such room"), { status: 404 });
   return group;
@@ -2459,6 +2577,95 @@ const channelTaskBlocked = (group: GroupRecord) =>
 // Recovery can synchronously emit room changes. Load coordination state
 // before registering store listeners or recovering interrupted routines.
 const groupQueues = new Map<string, Promise<void>>();
+
+function roomCoordinationMode(group: GroupRecord): GroupCoordinationMode {
+  return group.coordinationMode === "chief-supervised" ? "chief-supervised" : "section";
+}
+
+function roomSupervisor(group: GroupRecord): BotRecord | undefined {
+  if (roomCoordinationMode(group) !== "chief-supervised" || !group.supervisorBotId) return undefined;
+  const supervisor = store.bot(group.supervisorBotId);
+  return supervisor && !supervisor.hidden && supervisor.chiefOfStaff ? supervisor : undefined;
+}
+
+/** The section boundary for a room. A chief-supervised room is deliberately
+ * narrow: one specialist section plus one explicitly named Chief. This lets
+ * a Dev bot talk to Mark without making every ordinary bot able to read the
+ * General section or weakening direct peer authorization globally. */
+function roomSpecialistSection(group: GroupRecord, supervisor: BotRecord): string | undefined {
+  const members = group.memberIds
+    .filter((id) => id !== supervisor.id)
+    .map((id) => store.bot(id))
+    .filter((bot): bot is BotRecord => Boolean(bot));
+  const sections = [...new Set(members.map((member) => sectionKey(member.section)))];
+  if (sections.length !== 1 || !sections[0]) return undefined;
+  return sections[0];
+}
+
+/** Shared room authorization. Ordinary rooms retain the original strict
+ * rule. In a supervised room, the named Chief is an explicit bridge member;
+ * every other member must still belong to the sender's reachable section. */
+function roomSectionProblem(group: GroupRecord, speaker: BotRecord): string | undefined {
+  const supervisor = roomSupervisor(group);
+  if (roomCoordinationMode(group) === "chief-supervised") {
+    if (!supervisor) return "that room's Chief-supervised mode needs an active Chief supervisor";
+    const specialistSection = roomSpecialistSection(group, supervisor);
+    if (!specialistSection) return "that Chief-supervised room must contain one non-empty specialist section besides its supervisor";
+    if (!canAccessTeam(supervisor, specialistSection)) {
+      return `@${supervisor.name} does not manage the ${peerName(specialistSection)} section`;
+    }
+    if (speaker.id !== supervisor.id && !canAccessTeam(speaker, specialistSection)) {
+      return `that room's specialist section (${peerName(specialistSection)}) is outside your section`;
+    }
+    // The supervisor is the only permitted cross-section member. Any second
+    // foreign member would turn the exception into an unrestricted room.
+    const foreign = group.memberIds
+      .filter((id) => id !== supervisor.id)
+      .map((id) => store.bot(id))
+      .find((member) => member && sectionKey(member.section) !== specialistSection);
+    if (foreign) return `that room includes @${foreign.name}, outside its specialist section`;
+    return undefined;
+  }
+  const outsider = group.memberIds
+    .map((id) => store.bot(id))
+    .find((member) => member && !canAccessTeam(speaker, member.section));
+  return outsider
+    ? `that room includes @${outsider.name}, who is outside your section — tell the user what you wanted to post there instead`
+    : undefined;
+}
+
+/** Resolve a human room message without allowing a Chief to remain the
+ * accidental responder of a section-only room. Explicit @mentions still win;
+ * only the implicit/default path is constrained. */
+function roomHumanResponders(
+  text: string,
+  members: BotRecord[],
+  group: GroupRecord,
+): BotRecord[] {
+  const responders = roomResponders(text, members, group.defaultResponder);
+  if (roomCoordinationMode(group) !== "section") return responders;
+  const explicitlyMentioned = new Set(roomResponders(text, members, { kind: "mentions" }).map((member) => member.id));
+  if (explicitlyMentioned.size) return responders;
+  const nonChiefResponders = responders.filter((member) => !member.chiefOfStaff);
+  if (nonChiefResponders.length || group.defaultResponder.kind !== "member") return nonChiefResponders;
+  const selected = store.bot(group.defaultResponder.botId);
+  if (!selected?.chiefOfStaff) return responders;
+  const specialist = members.find((member) => !member.hidden && !member.chiefOfStaff);
+  return specialist ? [specialist] : [];
+}
+
+const TEAM_MENTION_POLICY =
+  "When you need a fellow bot to receive information, answer, review, or do work, explicitly @mention that teammate by name, even inside an existing thread. Do not rely on thread membership, implied context, or an untagged message. For actual OpenMausBot work or advice, use coordinate_bots and make the teammate visible in the room handoff with @Name.";
+
+const TEAM_LEAD_POLICY =
+  "Your primary team-lead responsibility is active coordination: turn the human's goal into assignments, delegate to the right teammates, assign clear ownership and acceptance checks, call out teammates with explicit @mentions when they need to act, track returned work, resolve gaps, and present one consolidated, evidence-based update to the human. Do not sit dormant as a normal responder waiting for isolated questions; take initiative within the user's scope, while asking for authority when an external or consequential decision is required.";
+
+function teamLeadRoomNames(botId: string): string[] {
+  return store.groups
+    .filter((group) => !group.dm && group.defaultResponder.kind === "member" && group.defaultResponder.botId === botId)
+    .map((group) => group.name);
+}
+
 function roomHandoffProblem(node: Pick<RoomHandoff, "groupId" | "threadId" | "botId"> & Partial<Pick<RoomHandoff, "kind">>, parent?: Pick<RoomHandoff, "groupId" | "threadId" | "botId">): string | undefined {
   const group = node.groupId ? store.group(node.groupId) : undefined;
   const bot = store.bot(node.botId);
@@ -2469,17 +2676,13 @@ function roomHandoffProblem(node: Pick<RoomHandoff, "groupId" | "threadId" | "bo
   // Every reader matters, including members not addressed to speak. The
   // recipient must be allowed to read its destination; the sender's grant
   // cannot silently give a specialist access to another team's transcript.
-  const outsideSection = (room: GroupRecord, speaker: BotRecord) => room.memberIds.some(id => {
-    const member = store.bot(id);
-    return member && !canAccessTeam(speaker, member.section);
-  });
-  if (group && outsideSection(group, bot)) return "Destination room includes a member outside the agent's section";
+  if (group && roomSectionProblem(group, bot)) return roomSectionProblem(group, bot);
   if (group && roomSetupPending(group)) return "Destination room setup is unfinished";
   if (parent) {
     const from = store.bot(parent.botId);
     const source = parent.groupId ? store.group(parent.groupId) : undefined;
     if (!from || from.hidden || (parent.groupId ? !source || !source.memberIds.includes(from.id) || !store.groupTaskByThread(source.id, parent.threadId) : !store.taskByThread(from.id, parent.threadId))) return "Source membership or task was removed";
-    if (!canAccessTeam(from, bot.section) || (source && outsideSection(source, from))) return "Room work cannot cross the sender's section boundary";
+    if (!canAccessTeam(from, bot.section) || (source && roomSectionProblem(source, from))) return "Room work cannot cross the sender's section boundary";
     if (source && group && source.id === group.id && parent.threadId !== node.threadId) return "Same-room work must stay in the originating conversation";
     if (!peerAllowed(from, bot.id)) return "The recipient is not an allowed peer of the sender";
   }
@@ -6110,6 +6313,7 @@ async function startTurn(
         // bot whose driver actually mounted the tools
         { id: "composio", label: "Connected apps", text: integrations.composio ? COMPOSIO_PROMPT : "" },
         { id: "mcp", label: "MCP servers", text: customMcpPrompt(Object.keys(integrations.custom ?? {})) },
+        { id: "team-collaboration", label: "Team collaboration", text: `${TEAM_MENTION_POLICY}${teamLeadRoomNames(bot.id).length ? `\n${TEAM_LEAD_POLICY} Current lead rooms: ${teamLeadRoomNames(bot.id).join(", ")}.` : ""}` },
         { id: "browser", label: "Browser", text: integrations.browser ? BUILT_IN_BROWSER_SYSTEM_PROMPT : "" },
         { id: "coordination", label: "Team", text: coordinationPrompt ? ` ${coordinationPrompt}` : "" },
         { id: "assignment", label: "Teammate task", text: coordinationNode ? `\n${coordinationSystemInstructions()}` : "" },
@@ -7687,13 +7891,19 @@ async function runGroupMemberTurn(
   const outsideRoom = integrations.agents
     ? reachablePeers(store.bots, bot).filter((peer) => !readyGroup.memberIds.includes(peer.id))
     : [];
+  const roomPolicy = roomCoordinationMode(readyGroup) === "chief-supervised"
+    ? `Chief-supervised room: ${readyGroup.supervisorBotId ? store.bot(readyGroup.supervisorBotId)?.name ?? "the named Chief" : "the named Chief"} may supervise the single specialist section; other cross-section access remains blocked.`
+    : "Section-only room: Chief of Staff members are passive unless explicitly mentioned; untagged messages go to a specialist responder, not the Chief. Treat this room policy as current configuration.";
+  const roomLead = readyGroup.defaultResponder.kind === "member" && readyGroup.defaultResponder.botId === bot.id;
   const system = [
     `You are ${bot.name}, a bot in the room "${readyGroup.name}" in OpenMausBot.`,
     bot.title && `Role: ${bot.title}.`,
     bot.description && `About: ${bot.description}`,
     `Room members: ${roster}, and ${userName} (the human).`,
     readyGroup.bulletin.trim() && `Room bulletin (shared instructions for everyone):\n${readyGroup.bulletin.trim()}`,
-    `Reply as yourself, briefly and conversationally. To bring a teammate in, mention them like @Name — they'll see the conversation and respond.`,
+    roomPolicy,
+    TEAM_MENTION_POLICY,
+    roomLead && TEAM_LEAD_POLICY,
     outsideRoom.length > 0 && orchestration && !orchestration.roomHandoffId && roomPeerRosterSystemPrompt(outsideRoom),
     integrations.agents && (CREDENTIAL_PROMPT + (orchestration && !orchestration.roomHandoffId ? THREADS_PROMPT : "")).trim(),
     integrations.agents && (!orchestration || orchestration.roomHandoffId) && "For actual OpenMausBot teamwork, discover IDs with list_room_targets and use coordinate_bots for advice or work in this or another room. Do not substitute native coding helpers for these named bots. Consult only when needed to make a decision; no discussion step is mandatory. Give concrete responsibilities, exact accessible paths and acceptance checks. End your turn after assigning; busy teammates queue and results automatically resume you. When they return, finish the requested verification and give the user one final answer. Native helper names are not evidence that an OpenMausBot teammate participated. Plain @mentions are only for conversational replies in this room.",
@@ -8522,7 +8732,7 @@ function startGroupTurn(
       },
     });
   }
-  let responders = roomResponders(text, members, group.defaultResponder);
+  let responders = roomHumanResponders(text, members, group);
   const explicitlyMentionedLead = roomResponders(text, availableMembers, { kind: "mentions" })[0];
   const goalCoordinator = channelMode === "goal"
     ? requestedGoalCoordinator ?? explicitlyMentionedLead ?? selectGroupGoalCoordinator(availableMembers, group.defaultResponder)
@@ -8809,16 +9019,8 @@ function roomPostEligibility(
   if (!group.memberIds.includes(bot.id)) {
     return { ok: false, status: 403, error: "you are not a member of that room" };
   }
-  const outsider = group.memberIds
-    .map((id) => store.bot(id))
-    .find((member) => member && !canAccessTeam(bot, member.section));
-  if (outsider) {
-    return {
-      ok: false,
-      status: 403,
-      error: `that room includes @${outsider.name}, who is outside your section — tell the user what you wanted to post there instead`,
-    };
-  }
+  const sectionProblem = roomSectionProblem(group, bot);
+  if (sectionProblem) return { ok: false, status: 403, error: sectionProblem };
   // A room whose setup the person has not finished has never been opened
   // for business, and its first message decides whether setup still counts
   // as pending. A bot must not be the one to settle that.
@@ -9693,6 +9895,9 @@ function configStatus() {
     imageGen: avatarImageStatus(cfg),
     // not a secret — the sidebar shows it
     profile: { name: cfg.profile?.name ?? "", email: cfg.profile?.email ?? "" },
+    // Server policy, exposed to administrators so the UI can distinguish a
+    // real global default from a per-bot approval choice.
+    approvalDefaults: { mode: cfg.approvalDefaults?.mode ?? "ask" },
     // not a secret — the settings picker shows it; "" = follow the system
     language: cfg.language ?? "",
     rooms: { turnTimeoutMinutes: roomTurnTimeoutMinutes(cfg) },
@@ -9709,6 +9914,7 @@ function configStatus() {
       // shell and the Settings UI read it so they offer nothing this server
       // would refuse.
       sharedComputers: sharedComputersEnabled(cfg),
+      remoteFullAccess: REMOTE_FULL_ACCESS,
       // Plugins → MCP servers switch: Claude bots also see this machine's
       // own Claude Code MCP servers
       claudeUserMcp: claudeUserMcpEnabled(cfg),
@@ -9740,6 +9946,8 @@ function configForAccess(status: ReturnType<typeof configStatus>, admin: boolean
   // source objects.
   return {
     ...status,
+    approvalDefaults: undefined,
+    features: { ...status.features, remoteFullAccess: false },
     signIn: { admins: [], members: [] },
     vps: { configured: status.vps.configured, sshAlias: "" },
     profile: { name: status.profile.name, email: "" },
@@ -13086,7 +13294,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return json(res, 409, { error: "room setup must be finished before the first message" });
       }
 
-      const patch: Partial<Pick<GroupRecord, "cwd" | "defaultResponder" | "bulletin" | "setupCompletedAt" | "setupSkippedAt">> = {};
+      const patch: Partial<Pick<GroupRecord, "cwd" | "defaultResponder" | "bulletin" | "coordinationMode" | "supervisorBotId" | "setupCompletedAt" | "setupSkippedAt">> = {};
       if (body.action === "complete") {
         const checked = validateBotCwd(body.cwd ?? null);
         if (!checked.ok) return json(res, 400, { error: checked.error });
@@ -13103,6 +13311,15 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         patch.cwd = checked.cwd ?? undefined;
         patch.defaultResponder = responder;
         patch.bulletin = body.bulletin;
+        const coordination = checkedRoomCoordination(
+          body.coordinationMode,
+          body.supervisorBotId,
+          group.memberIds,
+          group.section,
+        );
+        if (!coordination.ok) return json(res, 400, { error: coordination.error });
+        patch.coordinationMode = coordination.mode === "section" ? undefined : coordination.mode;
+        patch.supervisorBotId = coordination.supervisorBotId;
         patch.setupCompletedAt = Date.now();
       } else {
         patch.setupSkippedAt = Date.now();
@@ -13695,7 +13912,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (rawSelection !== undefined) requirePinnedClientThread(m[1], undefined);
       if (
         existingBot?.approvalGrant &&
-        (rawSelection !== undefined || body.approvalMode !== undefined || body.autoApprove !== undefined)
+        (rawSelection !== undefined || body.approvalMode !== undefined || body.autoApprove !== undefined || body.inheritApprovalDefault !== undefined)
       ) {
         return json(res, 409, { error: "wait for the approval-level change to finish before changing this setting" });
       }
@@ -13856,8 +14073,13 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (body.autoApprove !== undefined) {
         if (typeof body.autoApprove !== "boolean") return json(res, 400, { error: "autoApprove must be true or false" });
       }
+      if (body.inheritApprovalDefault !== undefined && typeof body.inheritApprovalDefault !== "boolean") {
+        return json(res, 400, { error: "inheritApprovalDefault must be true or false" });
+      }
       let requestedApprovalMode: ApprovalMode;
-      if (body.approvalMode !== undefined) {
+      if (body.inheritApprovalDefault === true) {
+        requestedApprovalMode = cfg.approvalDefaults?.mode ?? "ask";
+      } else if (body.approvalMode !== undefined) {
         if (!isApprovalMode(body.approvalMode)) {
           return json(res, 400, {
             error: "approvalMode must be ask, auto, full, or custom",
@@ -13873,14 +14095,18 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         requestedApprovalMode = approvalModeFor(existingBot ?? {});
       }
       const currentApprovalMode = approvalModeFor(existingBot ?? {});
-      const approvalChangeRequested = body.approvalMode !== undefined || body.autoApprove !== undefined;
+      const approvalChangeRequested = body.approvalMode !== undefined || body.autoApprove !== undefined || body.inheritApprovalDefault === true;
       if (existingBot?.busy && approvalChangeRequested && requestedApprovalMode !== currentApprovalMode) {
         return json(res, 409, {
           error: "stop this bot's turn before changing its approval level",
         });
       }
-      if (body.approvalMode !== undefined || body.autoApprove !== undefined) {
+      if (body.approvalMode !== undefined || body.autoApprove !== undefined || body.inheritApprovalDefault === true) {
+        if (body.inheritApprovalDefault === true && requestedApprovalMode === "full" && !remoteFullAccessAllowed(auth)) {
+          return json(res, 403, { error: "remote Full access is not enabled on this server" });
+        }
         patch.approvalMode = requestedApprovalMode;
+        patch.approvalModeOverride = body.inheritApprovalDefault === true ? false : true;
         // Keep the old wire field truthful for older paired apps. It means
         // specifically safe Auto, not "some mode that approves things".
         patch.autoApprove = requestedApprovalMode === "auto";
@@ -13908,7 +14134,8 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         ((requestedApprovalMode === "full" || requestedApprovalMode === "custom") &&
           currentApprovalMode !== requestedApprovalMode) ||
         (currentApprovalMode === "custom" && requestedApprovalMode !== "custom");
-      if (requiresPrivateApprovalTransition) {
+      const remoteFullTransition = requestedApprovalMode === "full" && remoteFullAccessAllowed(auth);
+      if (requiresPrivateApprovalTransition && !remoteFullTransition) {
         return json(res, 403, {
           error: "This approval-level change can only be made from the packaged desktop app",
         });
@@ -15118,8 +15345,9 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         const mode = body.approvalMode ?? (body.autoApprove ? "auto" : "ask");
         // Elevated modes still require the trusted desktop transition. A
         // thread settings PATCH cannot manufacture that grant.
-        if (mode !== "ask" && mode !== "auto" && mode !== "edits") return json(res, 403, { error: "Full and Custom access require trusted desktop confirmation" });
-        if (approvalModeFor(current) === "custom") return json(res, 403, { error: "Leaving Custom approval requires confirmation in the packaged desktop app" });
+        const remoteFullTransition = mode === "full" && remoteFullAccessAllowed(auth);
+        if (mode !== "ask" && mode !== "auto" && mode !== "edits" && !remoteFullTransition) return json(res, 403, { error: "Full and Custom access require trusted desktop confirmation" });
+        if (approvalModeFor(current) === "custom" && !remoteFullTransition) return json(res, 403, { error: "Leaving Custom approval requires confirmation in the packaged desktop app" });
         if (!supportsApprovalMode(registry.cliTarget((patch.modelSelection ?? current.modelSelection).instanceId)?.driverKind, mode)) {
           return json(res, 400, { error: "This provider does not support the selected approval level" });
         }
@@ -15133,7 +15361,9 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         }
         patch.approvalMode = mode;
         patch.autoApprove = mode === "auto";
+        patch.approvalModeOverride = true;
       }
+      if (body.resetApprovalToAsk === true) patch.approvalModeOverride = true;
       if (patch.modelSelection) {
         const checked = checkedTaskModelSwitch({ ...current,
           ...(patch.approvalMode ? { approvalMode: patch.approvalMode, autoApprove: patch.autoApprove } : {}),
@@ -15978,6 +16208,60 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       } finally {
         mcpConfigBusy = false;
       }
+    }
+
+    // ── server-wide approval default ──
+    // This is intentionally a separate admin-only route. A bot can reach
+    // loopback APIs from a tool call, so changing the default is never folded
+    // into the ordinary bot-accessible configuration surface.
+    if (path === "/api/approval-default" && method === "GET") {
+      if (!auth.scopes.includes("admin")) return json(res, 403, { error: "administrator access required" });
+      return json(res, 200, {
+        approvalDefaults: { mode: cfg.approvalDefaults?.mode ?? "ask" },
+        bots: store.bots.length,
+        tasks: store.bots.reduce((count, bot) => count + (bot.tasks?.length ?? 0), 0),
+      });
+    }
+    if (path === "/api/approval-default" && (method === "PUT" || method === "PATCH")) {
+      if (!auth.scopes.includes("admin")) return json(res, 403, { error: "administrator access required" });
+      const body = await readBody(req);
+      if (!body || typeof body !== "object" || Array.isArray(body)) {
+        return json(res, 400, { error: "body must be a JSON object" });
+      }
+      const mode = body.mode;
+      if (!isApprovalMode(mode) || mode === "custom") {
+        return json(res, 400, { error: "mode must be ask, edits, auto, or full" });
+      }
+      if (body.applyToExisting !== undefined && typeof body.applyToExisting !== "boolean") {
+        return json(res, 400, { error: "applyToExisting must be a boolean" });
+      }
+      if (body.emergency !== undefined && typeof body.emergency !== "boolean") {
+        return json(res, 400, { error: "emergency must be a boolean" });
+      }
+      if (body.reason !== undefined && (typeof body.reason !== "string" || body.reason.length > 500)) {
+        return json(res, 400, { error: "reason must be a string of at most 500 characters" });
+      }
+      const applyToExisting = body.applyToExisting !== false;
+      if (mode === "full" && !remoteFullAccessAllowed(auth)) {
+        return json(res, 403, { error: "remote Full access is not enabled on this server" });
+      }
+      const active = store.bots.filter((bot) => bot.busy || bot.approvalGrant || (bot.tasks ?? []).some((task) => task.busy));
+      if (active.length) {
+        return json(res, 409, { error: "stop all working bots before changing the global approval default", activeBots: active.map((bot) => bot.name) });
+      }
+      const result = store.applyApprovalDefault(mode, applyToExisting);
+      saveConfig({ approvalDefaults: { mode } });
+      cfg.approvalDefaults = { mode };
+      appendApprovalDefaultAudit(DATA_DIR, {
+        actor: requestSource(req),
+        mode,
+        applyToExisting,
+        ...(body.emergency === true ? { emergency: true } : {}),
+        ...result,
+        ...(typeof body.reason === "string" && body.reason ? { reason: body.reason } : {}),
+      });
+      broadcast({ kind: "config", ...configStatus() });
+      return json(res, 200, { approvalDefaults: { mode }, ...result });
     }
 
     // ── app config (API keys — never echoed back, booleans only) ──

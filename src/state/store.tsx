@@ -196,6 +196,8 @@ export type GroupDefaultResponder =
   | { kind: "everyone" }
   | { kind: "mentions" };
 
+export type GroupCoordinationMode = "section" | "chief-supervised";
+
 /** A room: several bots + you in one shared thread. */
 export interface Group {
   id: string;
@@ -221,6 +223,9 @@ export interface Group {
   pinnedMessageId?: string;
   /** sidebar section heading this room is filed under (shared with bots) */
   section?: string;
+  /** Explicit room-level exception for one Chief supervising one section. */
+  coordinationMode?: GroupCoordinationMode;
+  supervisorBotId?: string;
   /** New user-created rooms remain in setup until Save or Skip. */
   setupCompletedAt?: number | null;
   setupSkippedAt?: number | null;
@@ -263,6 +268,8 @@ export interface Task {
   cwd?: string | null;
   modelSelection?: ModelSelection;
   approvalMode?: ApprovalMode;
+  /** false means the task follows the server-wide approval default. */
+  approvalModeOverride?: boolean;
   autoApprove?: boolean;
   alwaysAllow?: string[];
   activity?: Bot["activity"];
@@ -357,6 +364,8 @@ export interface Bot {
   autoApprove?: boolean;
   /** Explicit approval level; absent records use the legacy autoApprove bit. */
   approvalMode?: ApprovalMode;
+  /** false means this bot follows the server-wide approval default. */
+  approvalModeOverride?: boolean;
   /** tools this bot may always use without asking */
   alwaysAllow?: string[];
   /** speak this bot's replies aloud as they settle */
@@ -483,6 +492,8 @@ export interface ConfigStatus {
   fleet?: { available: boolean };
   budgets?: { monthlyUsd?: number; warnAtPercent?: number };
   billing?: { currency?: string; prices?: Record<string, { inputPerMillion: number; outputPerMillion: number; cachedInputPerMillion?: number }> };
+  /** Administrator-controlled default for new and inherited work. */
+  approvalDefaults?: { mode: "ask" | "edits" | "auto" | "full" };
   composio: { configured: boolean; mode?: "managed" | "self-hosted" | "unavailable" };
   box: { configured: boolean };
   vps: { configured: boolean; sshAlias: string };
@@ -518,7 +529,7 @@ export interface ConfigStatus {
   /** UI language override; "" (or absent) follows the system language. */
   language?: string;
   /** Opt-in flags. Absent means off. */
-  features?: { skillAuthoring: boolean; showToolCalls?: boolean; browser?: boolean; sharedComputers?: boolean; claudeUserMcp?: boolean };
+  features?: { skillAuthoring: boolean; showToolCalls?: boolean; browser?: boolean; sharedComputers?: boolean; claudeUserMcp?: boolean; remoteFullAccess?: boolean };
   /** First-run progress: whether the welcome tour was finished and which
    * one-time hints were dismissed. Server-owned so it follows the workspace. */
   onboarding?: OnboardingStatus;
@@ -548,7 +559,7 @@ export interface BrowserProfile {
 
 export type ConfigStatusFrame = Pick<
   ConfigStatus,
-  "xai" | "composio" | "box" | "vps" | "rooms" | "threads" | "localVm" | "opencodeGo" | "tts" | "imageGen" | "profile" | "language" | "features" | "onboarding" | "browserEngine" | "browserProfiles" | "edition" | "budgets" | "billing"
+  "xai" | "composio" | "box" | "vps" | "rooms" | "threads" | "localVm" | "opencodeGo" | "tts" | "imageGen" | "profile" | "language" | "features" | "onboarding" | "browserEngine" | "browserProfiles" | "edition" | "budgets" | "billing" | "approvalDefaults"
 >;
 
 export function configStatusFromFrame(frame: ConfigStatusFrame): ConfigStatus {
@@ -572,6 +583,7 @@ export function configStatusFromFrame(frame: ConfigStatusFrame): ConfigStatus {
     edition: frame.edition,
     budgets: frame.budgets,
     billing: frame.billing,
+    approvalDefaults: frame.approvalDefaults,
   };
 }
 
@@ -885,7 +897,7 @@ export type Action =
   | {
       type: "patchGroup";
       groupId: string;
-      patch: Partial<Pick<Group, "name" | "bulletin" | "memberIds" | "defaultResponder" | "pinnedMessageId" | "section">>;
+      patch: Omit<Partial<Pick<Group, "name" | "bulletin" | "memberIds" | "defaultResponder" | "pinnedMessageId" | "section" | "coordinationMode" | "supervisorBotId">>, "supervisorBotId"> & { supervisorBotId?: string | null };
     }
   | { type: "deleteGroup"; groupId: string }
   | { type: "newGroupTask"; groupId: string }
@@ -1797,11 +1809,18 @@ export function reducer(state: AppState, action: Action): AppState {
       return updateBot(state, action.botId, (b) => ({ ...b, activeLeafId: cur }));
     }
     // optimistic room edits; the server's group frame confirms them later
-    case "patchGroup":
+    case "patchGroup": {
+      const { supervisorBotId: requestedSupervisor, ...restPatch } = action.patch;
+      const patch: typeof restPatch & { supervisorBotId?: string } = requestedSupervisor === null
+        ? restPatch
+        : requestedSupervisor === undefined
+          ? restPatch
+          : { ...restPatch, supervisorBotId: requestedSupervisor };
       return {
         ...state,
-        groups: state.groups.map((g) => (g.id === action.groupId ? { ...g, ...action.patch } : g)),
+        groups: state.groups.map((g) => (g.id === action.groupId ? { ...g, ...patch } : g)),
       };
+    }
     // handled entirely by the async wrapper
     case "pendingQueued": {
       if (state.consumedQueueIds[action.queueId]) {
@@ -2065,14 +2084,19 @@ export async function persistTaskApproval(
   botId: string, threadId: string, patch: TaskUpdatePatch,
   bridge: TrustedApprovalBridge | undefined,
   request: (path: string, init?: RequestInit) => Promise<{ bot: BotAnnouncement }> = api,
+  remoteFullAccess = false,
 ): Promise<BotAnnouncement> {
   const { approvalMode, autoApprove, confirmFullAccess, acknowledgeLocalAuto, ...ordinary } = patch;
   const mode = approvalMode ?? (autoApprove === undefined ? undefined : autoApprove ? "auto" : "ask");
   if (mode === "full" && confirmFullAccess !== true) throw new Error("Confirm Full access for this thread first");
-  if ((mode === "full" || mode === "custom") && !bridge) throw new Error("This approval change requires the packaged desktop app");
+  if ((mode === "full" || mode === "custom") && !bridge && !(mode === "full" && remoteFullAccess)) throw new Error("This approval change requires the packaged desktop app");
   if (mode && bridge) {
     if (Object.keys(ordinary).length) await request(`/api/bots/${botId}/tasks/${threadId}`, { method: "PATCH", body: JSON.stringify(ordinary) });
     return bridge.setMode(botId, mode, { threadId, threadOnly: true, acknowledgeLocalAuto: acknowledgeLocalAuto === true });
+  }
+  if (mode === "full" && remoteFullAccess) {
+    const result = await request(`/api/bots/${botId}/tasks/${threadId}`, { method: "PATCH", body: JSON.stringify({ ...ordinary, approvalMode, autoApprove, acknowledgeLocalAuto }) });
+    return result.bot;
   }
   const result = await request(`/api/bots/${botId}/tasks/${threadId}`, { method: "PATCH", body: JSON.stringify({ ...ordinary, approvalMode, autoApprove, acknowledgeLocalAuto }) });
   return result.bot;
@@ -2091,6 +2115,7 @@ export async function persistBotUpdate(
   trustedApprovals: TrustedApprovalBridge | undefined =
     typeof window === "undefined" ? undefined : window.ogb?.approvals,
   currentBot?: BotAnnouncement,
+  remoteFullAccess = false,
 ): Promise<BotAnnouncement> {
   const {
     approvalMode,
@@ -2119,6 +2144,14 @@ export async function persistBotUpdate(
 
   if (approvalMode === "full" && confirmFullAccess !== true) {
     throw new Error("Confirm the Full access warning before enabling it");
+  }
+  if (approvalMode === "full" && remoteFullAccess) {
+    const result = await request(`/api/bots/${botId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ ...ordinaryPatch, approvalMode: "full" }),
+      signal,
+    });
+    return result.bot;
   }
   if (!trustedApprovals || approvalMode === undefined) {
     throw new Error("This approval-level change requires the packaged desktop app");
@@ -2357,7 +2390,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     () =>
       createBotPatchQueue({
         send: (botId, patch, signal, currentBot) =>
-          persistBotUpdate(botId, patch, signal, api, window.ogb?.approvals, currentBot),
+          persistBotUpdate(botId, patch, signal, api, window.ogb?.approvals, currentBot, stateRef.current.config?.features?.remoteFullAccess === true),
         reconcile: async (botId, signal) => {
           const result: { bots: BotAnnouncement[] } = await api("/api/bots", { signal });
           return result.bots.find((candidate) => candidate.id === botId) ?? null;
@@ -2443,7 +2476,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
               threadId, modelSelection: patch.modelSelection, updateBotDefault: Boolean(patch.updateBotDefault),
             });
           }
-          return persistTaskApproval(botId, threadId, patch, window.ogb?.approvals);
+          return persistTaskApproval(botId, threadId, patch, window.ogb?.approvals, api, stateRef.current.config?.features?.remoteFullAccess === true);
         });
       // Later edits still get saved after an earlier failure, but a send
       // awaiting this batch must observe every rejected setting in it. A

@@ -384,7 +384,13 @@ export function Composer({
   const approvalEngine = modeBot
     ? state.instances.find((instance) => instance.instanceId === modeBot.modelSelection.instanceId)
     : undefined;
-  const trustedThreadAccess = Boolean(!remoteClient && window.ogb?.approvals && capabilities.host.packaged);
+  // Full thread access is available through the packaged desktop's private
+  // bridge or, when explicitly enabled by the server, to paired admins. The
+  // latter is still constrained by the container deployment boundary.
+  const trustedThreadAccess = Boolean(
+    (!remoteClient && window.ogb?.approvals && capabilities.host.packaged) ||
+    state.config?.features?.remoteFullAccess === true,
+  );
   const uploadImage = useCallback(async (file: File): Promise<Attachment | null> => {
     const optimistic = optimisticImageAttachment(file);
     if (!optimistic) return null;

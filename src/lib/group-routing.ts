@@ -4,13 +4,19 @@ import { t } from "./i18n";
 /** Be defensive around rooms loaded while an older server is still running,
  * and around a lead removed by another client before the group patch arrives. */
 export function effectiveDefaultResponder(
-  group: Pick<Group, "defaultResponder">,
-  members: Array<{ id: string }>,
+  group: Pick<Group, "defaultResponder"> & Partial<Pick<Group, "coordinationMode">>,
+  members: Array<{ id: string; chiefOfStaff?: boolean; hidden?: boolean }>,
 ): GroupDefaultResponder {
   const value = group.defaultResponder;
   if (value?.kind === "everyone" || value?.kind === "mentions") return value;
-  if (value?.kind === "member" && members.some((member) => member.id === value.botId)) return value;
-  return members[0] ? { kind: "member", botId: members[0].id } : { kind: "mentions" };
+  if (value?.kind === "member") {
+    const selected = members.find((member) => member.id === value.botId);
+    if (selected && (group.coordinationMode === "chief-supervised" || !selected.chiefOfStaff)) return value;
+  }
+  const fallback = group.coordinationMode === "chief-supervised"
+    ? members[0]
+    : members.find((member) => !member.chiefOfStaff);
+  return fallback ? { kind: "member", botId: fallback.id } : { kind: "mentions" };
 }
 
 export function defaultResponderName(group: Group, members: Bot[]): string | null {
@@ -41,17 +47,19 @@ export function groupComposerHint(group: Group, members: Bot[]): string {
 /** Same routing sendGroup uses: explicit @mentions win, otherwise the
  * room's default responder. Keep this aligned with server/store.ts
  * `roomResponders` / `mentionedBots`. */
-export function roomRespondersForComposer<T extends { id: string; name: string; hidden?: boolean }>(
+export function roomRespondersForComposer<T extends { id: string; name: string; hidden?: boolean; chiefOfStaff?: boolean }>(
   text: string,
   members: T[],
-  group: Pick<Group, "defaultResponder">,
+  group: Pick<Group, "defaultResponder"> & Partial<Pick<Group, "coordinationMode">>,
 ): T[] {
   const available = members.filter((member) => !member.hidden);
   if (/(?:^|\s)@everyone\b/i.test(text)) return available;
   const mentioned = mentionedMembers(text, available);
   if (mentioned.length) return mentioned;
   const fallback = effectiveDefaultResponder(group, available);
-  if (fallback.kind === "everyone") return available;
+  if (fallback.kind === "everyone") return group.coordinationMode === "chief-supervised"
+    ? available
+    : available.filter((member) => !member.chiefOfStaff);
   if (fallback.kind === "member") {
     const lead = available.find((member) => member.id === fallback.botId);
     return lead ? [lead] : [];

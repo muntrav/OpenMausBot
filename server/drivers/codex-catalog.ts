@@ -11,8 +11,14 @@ import type { ModelCatalog } from "../contracts.ts";
 import { killCliTree, spawnCli } from "../procs.ts";
 import { mergeLocalInject } from "./local-inject.ts";
 
+/** OpenMausBot's default agent profile. Keep this aligned with the OpenClaw
+ * runtime so newly created bots and Agent Room participants start on the same
+ * model/effort pair unless an operator explicitly chooses another selection. */
+export const DEFAULT_CODEX_MODEL = "gpt-5.6-luna";
+export const DEFAULT_AGENT_EFFORT = "high" as const;
+
 export const STATIC_CODEX_MODELS: ModelCatalog = {
-  default: "gpt-5.6-sol",
+  default: DEFAULT_CODEX_MODEL,
   options: [
     { id: "gpt-5.6-sol", label: "GPT-5.6 Sol" },
     { id: "gpt-5.6-terra", label: "GPT-5.6 Terra" },
@@ -159,10 +165,12 @@ export function readCodexAppServerModelCatalog(
           finish(null);
           return;
         }
-        finish({
-          default: defaultModel && seen.has(defaultModel) ? defaultModel : options[0].id,
-          options,
-        });
+        const preferredDefault = options.some((option) => option.id === DEFAULT_CODEX_MODEL)
+          ? DEFAULT_CODEX_MODEL
+          : defaultModel && seen.has(defaultModel)
+            ? defaultModel
+            : options[0].id;
+        finish({ default: preferredDefault, options });
       }
     });
     child.on("error", () => finish(null));

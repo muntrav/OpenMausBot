@@ -44,12 +44,15 @@ export type BotUpdatePatch = Partial<
    * confirmed. StoreProvider consumes it before the private Electron request;
    * it is never sent over HTTP or folded into bot state. */
   confirmFullAccess?: boolean;
+  /** Ask the server to clear this bot's explicit approval override and use
+   * the administrator-controlled server default. */
+  inheritApprovalDefault?: boolean;
 };
 
 /** A wire patch after clear-only values have been normalized for Bot state. */
 export type BotStatePatch = Omit<
   BotUpdatePatch,
-  "computer" | "acknowledgeLocalAuto" | "confirmFullAccess"
+  "computer" | "acknowledgeLocalAuto" | "confirmFullAccess" | "inheritApprovalDefault"
 > & {
   computer?: Bot["computer"];
 };
@@ -106,6 +109,7 @@ const stateOverlay = (patch: BotUpdatePatch): BotStatePatch => {
   const {
     acknowledgeLocalAuto: _localAck,
     confirmFullAccess: _fullConfirmation,
+    inheritApprovalDefault: _inheritDefault,
     computer,
     ...fields
   } = patch;

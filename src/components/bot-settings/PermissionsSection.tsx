@@ -123,6 +123,11 @@ export function PermissionsSection({
           Default for new threads, routines and delegated work. Existing threads keep their own level;
           change it from that thread’s composer.
         </div>
+        <div className="mt-2 text-[12px] text-ink-secondary">
+          {bot.approvalModeOverride === false && state.config?.approvalDefaults
+            ? `Following the server-wide default: ${state.config.approvalDefaults.mode}.`
+            : "This bot has an explicit approval override."}
+        </div>
         <div className="mt-3">
           <ApprovalModeSelector
             approvalMode={bot.approvalMode}

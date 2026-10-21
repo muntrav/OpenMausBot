@@ -4,7 +4,7 @@
 // keeps every message a departing bot already sent.
 import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { track } from "@/lib/analytics";
-import { useStore, type Group } from "@/state/store";
+import { useStore, type Group, type GroupCoordinationMode } from "@/state/store";
 import { BotPickerList } from "./BotPickerList";
 import { nextMemberIds } from "@/lib/room-members";
 
@@ -78,6 +78,17 @@ export function ManageMembersPanel({
     bots.map((b) => b.id),
   );
   const changed = memberIds.length !== group.memberIds.length || memberIds.some((id, i) => id !== group.memberIds[i]);
+  const currentMode: GroupCoordinationMode = group.coordinationMode === "chief-supervised" ? "chief-supervised" : "section";
+  const [coordinationMode, setCoordinationMode] = useState<GroupCoordinationMode>(currentMode);
+  const chiefCandidates = bots.filter((bot) => bot.chiefOfStaff && !bot.hidden && memberIds.includes(bot.id));
+  const [supervisorBotId, setSupervisorBotId] = useState(group.supervisorBotId ?? chiefCandidates[0]?.id ?? "");
+  const specialistSections = [...new Set(memberIds
+    .filter((id) => id !== supervisorBotId)
+    .map((id) => state.bots.find((bot) => bot.id === id)?.section?.trim() ?? ""))];
+  const specialistSection = specialistSections.length === 1 && specialistSections[0] ? specialistSections[0] : null;
+  const coordinationChanged =
+    coordinationMode !== currentMode ||
+    (coordinationMode === "chief-supervised" ? supervisorBotId !== (group.supervisorBotId ?? chiefCandidates[0]?.id ?? "") : Boolean(group.supervisorBotId));
 
   const save = () => {
     if (!memberIds.length) return;
@@ -88,12 +99,31 @@ export function ManageMembersPanel({
       setSaveError("This group's members changed while the panel was open. Close it and try again.");
       return;
     }
-    if (changed) {
-      dispatch({ type: "patchGroup", groupId: group.id, patch: { memberIds } });
+    if (coordinationMode === "chief-supervised") {
+      if (!chiefCandidates.some((bot) => bot.id === supervisorBotId)) {
+        setSaveError("Choose an active Chief of Staff who is a member of this room.");
+        return;
+      }
+      if (!specialistSection) {
+        setSaveError("Chief-supervised rooms need one non-empty specialist section besides the Chief.");
+        return;
+      }
+      if (group.section?.trim() && group.section.trim() !== specialistSection) {
+        setSaveError(`This room is filed under ${group.section}, but its specialist members are in ${specialistSection}.`);
+        return;
+      }
+    }
+    if (changed || coordinationChanged) {
+      dispatch({ type: "patchGroup", groupId: group.id, patch: {
+        memberIds,
+        coordinationMode,
+        supervisorBotId: coordinationMode === "chief-supervised" ? supervisorBotId : null,
+      } });
       track("room_members_changed", {
         members: memberIds.length,
         added: memberIds.filter((id) => !group.memberIds.includes(id)).length,
         removed: group.memberIds.filter((id) => !memberIds.includes(id)).length,
+        coordinationMode,
       });
     }
     onClose();
@@ -113,6 +143,38 @@ export function ManageMembersPanel({
       >
         <div className="mb-1 text-[15px] font-semibold text-ink">Manage Members</div>
         <div className="mb-3 truncate text-[13px] text-ink-secondary">{group.name}</div>
+        <div className="mb-3 rounded-xl border border-hairline/40 bg-panel p-3">
+          <label htmlFor={`room-coordination-${group.id}`} className="block text-[12px] font-medium text-ink">Room access</label>
+          <select
+            id={`room-coordination-${group.id}`}
+            value={coordinationMode}
+            onChange={(event) => setCoordinationMode(event.target.value as GroupCoordinationMode)}
+            className="mt-1.5 w-full rounded-lg border border-hairline/50 bg-card px-2.5 py-2 text-[12px] text-ink outline-none focus:border-accent"
+          >
+            <option value="section">Section-only (recommended)</option>
+            <option value="chief-supervised">Chief-supervised</option>
+          </select>
+          {coordinationMode === "chief-supervised" ? (
+            <>
+              <label htmlFor={`room-supervisor-${group.id}`} className="mt-2 block text-[12px] font-medium text-ink">Supervising Chief</label>
+              <select
+                id={`room-supervisor-${group.id}`}
+                value={supervisorBotId}
+                onChange={(event) => setSupervisorBotId(event.target.value)}
+                className="mt-1.5 w-full rounded-lg border border-hairline/50 bg-card px-2.5 py-2 text-[12px] text-ink outline-none focus:border-accent"
+                disabled={!chiefCandidates.length}
+              >
+                {!chiefCandidates.length && <option value="">No active Chief in this room</option>}
+                {chiefCandidates.map((bot) => <option key={bot.id} value={bot.id}>{bot.name}</option>)}
+              </select>
+              <p className="mt-2 text-[11px] leading-relaxed text-ink-secondary">
+                Allows this Chief to supervise the {specialistSection ?? "one specialist"} section. Other cross-section members remain blocked.
+              </p>
+            </>
+          ) : (
+            <p className="mt-2 text-[11px] leading-relaxed text-ink-secondary">Only members in the same section can delegate or post here.</p>
+          )}
+        </div>
         <BotPickerList bots={bots} picked={picked} onToggle={toggle} emptyHint="Create a bot first — groups are made of bots." />
         {!memberIds.length && <div className="mt-2 text-[12px] text-ink-secondary">A group needs at least one bot.</div>}
         {saveError && (

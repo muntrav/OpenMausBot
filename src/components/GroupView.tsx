@@ -4,7 +4,7 @@
 // default responder; @mentions override that routing.
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { activeLocale, t } from "@/lib/i18n";
-import { ArrowDown, Check, ChevronDown, ChevronRight, Folder, FolderOpen, Loader2, MessageSquareReply, Pin, PinOff, Plus, Search, X } from "lucide-react";
+import { ArrowDown, Check, ChevronDown, ChevronRight, Folder, FolderOpen, Loader2, MessageSquareReply, Pin, PinOff, Plus, Search, ShieldCheck, X } from "lucide-react";
 import {
   api,
   useStore,
@@ -381,6 +381,9 @@ function DefaultResponderSelect({ group, members }: { group: Group; members: Bot
       : responder.kind === "mentions"
         ? t("room.responder.mentions")
         : t("room.responder.lead", { name: lead?.name ?? t("room.responder.leadFallback") });
+  const selectableMembers = group.coordinationMode === "chief-supervised"
+    ? members
+    : members.filter((member) => !member.chiefOfStaff);
 
   const change = (nextValue: string) => {
     let next: GroupDefaultResponder;
@@ -399,7 +402,7 @@ function DefaultResponderSelect({ group, members }: { group: Group; members: Bot
         className="h-8 max-w-[190px] appearance-none truncate rounded-full border border-hairline/40 bg-raised/60 py-1 pl-3 pr-7 text-[12.5px] font-medium text-ink outline-none hover:bg-raised focus:border-accent"
       >
         <optgroup label={t("room.responder.groupLead")}>
-          {members.map((member) => (
+          {selectableMembers.map((member) => (
             <option key={member.id} value={`member:${member.id}`}>
               {t("room.responder.leadOption", { name: member.name })}
             </option>
@@ -1116,6 +1119,11 @@ export function GroupView({ group }: { group: Group }) {
       >
         <div className="flex min-w-0 items-center gap-2" style={headerNoDragStyle}>
           <span className="truncate text-[15px] font-semibold text-ink">{group.name}</span>
+          {group.coordinationMode === "chief-supervised" && (
+            <span className="inline-flex shrink-0 items-center gap-1 rounded-full border border-accent/25 bg-accent/10 px-2 py-1 text-[10px] font-medium text-accent" title="This room has an explicit Chief-supervised access policy">
+              <ShieldCheck size={11} aria-hidden="true" /> Chief-supervised
+            </span>
+          )}
           {!setupPending && !group.dm && <GroupTaskPicker group={group} />}
         </div>
         <div

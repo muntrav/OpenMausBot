@@ -1,4 +1,5 @@
 import type { EffortLevel, ModelCatalog, ModelSelection, ProviderSnapshot } from "./contracts.ts";
+import { DEFAULT_AGENT_EFFORT, DEFAULT_CODEX_MODEL } from "./drivers/codex-catalog.ts";
 
 interface SelectableInstance {
   instanceId: string;
@@ -6,6 +7,18 @@ interface SelectableInstance {
   snapshot: ProviderSnapshot;
   models: ModelCatalog;
   capabilities?: { effortLevels?: readonly EffortLevel[]; modelVariants?: boolean };
+}
+
+function supportsModel(instance: SelectableInstance, model: string): boolean {
+  return instance.models.default === model || instance.models.options.some((option) => option.id === model);
+}
+
+function defaultSelectionFor(instance: SelectableInstance, model: string): ModelSelection {
+  const selection: ModelSelection = { instanceId: instance.instanceId, model };
+  if (instance.capabilities?.effortLevels?.includes(DEFAULT_AGENT_EFFORT)) {
+    selection.effort = DEFAULT_AGENT_EFFORT;
+  }
+  return selection;
 }
 
 /** A saved choice is intentional: an unavailable provider or removed model
@@ -31,6 +44,15 @@ export function selectDefaultModelSelection(
     return selection;
   }
   const available = instances.filter((instance) => instance.snapshot.state === "available");
+  // New bots and new room participants should use the same OpenAI profile as
+  // OpenClaw by default. Prefer Luna even when another provider advertises a
+  // provider-side default. Fall back to that provider's default only when the
+  // installed catalog does not expose Luna, preserving setup compatibility.
+  const codex = available.filter((instance) => instance.driverKind === "codex");
+  const luna = codex.find((instance) => supportsModel(instance, DEFAULT_CODEX_MODEL));
+  if (luna) return defaultSelectionFor(luna, DEFAULT_CODEX_MODEL);
+  const codexFallback = codex[0];
+  if (codexFallback) return defaultSelectionFor(codexFallback, codexFallback.models.default);
   const pick = available.find((instance) => instance.driverKind === "claudeAgent") ?? available[0];
-  return { instanceId: pick?.instanceId ?? "", model: pick?.models.default ?? "" };
+  return pick ? defaultSelectionFor(pick, pick.models.default) : { instanceId: "", model: "" };
 }

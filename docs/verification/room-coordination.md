@@ -144,6 +144,15 @@ preview/server processes afterward; retain evidence without credentials.
 ## Limits and safety
 
 Existing peer allow-lists/approvals and every room reader's section still apply.
+Rooms are section-only by default. A user may explicitly mark a room
+`chief-supervised` from its **Manage Members** control and select one active
+Chief of Staff as `supervisorBotId`. That room may then contain exactly one
+non-empty specialist section plus that Chief. The Chief must explicitly manage
+the specialist section; the Chief is the only cross-section member exempted by
+the room policy. A mixed room with two specialist sections, an inactive or
+non-Chief supervisor, or a Chief without that managed section is rejected.
+The exception is room-scoped and does not change `canAccessTeam`, direct peer
+access, or any other room.
 Ordinary chats use one bounded coordination tool for teammate work instead of
 the competing ask/delegate/peer-thread execution paths. A top-level direct turn
 can still use `start_thread` to open separate work on itself, without moving the

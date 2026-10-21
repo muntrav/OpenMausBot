@@ -68,9 +68,35 @@ describe("new bot default model selection", () => {
       .toEqual({ instanceId: "", model: "" });
   });
 
-  it("keeps the existing Claude preference when no default was saved", () => {
-    expect(selectDefaultModelSelection([codex, claude])).toEqual({ instanceId: "claude", model: "claude-default" });
-    expect(selectDefaultModelSelection([codex])).toEqual({ instanceId: "codex", model: "codex-default" });
+  it("prefers the Codex default over Claude when Luna is unavailable", () => {
+    expect(selectDefaultModelSelection([codex, claude])).toEqual({ instanceId: "codex", model: "codex-default", effort: "high" });
+    expect(selectDefaultModelSelection([codex])).toEqual({ instanceId: "codex", model: "codex-default", effort: "high" });
     expect(selectDefaultModelSelection([])).toEqual({ instanceId: "", model: "" });
+  });
+
+  it("defaults every new agent to GPT-5.6 Luna with high effort when Luna is available", () => {
+    const luna = {
+      ...codex,
+      models: {
+        default: "gpt-5.6-sol",
+        options: [
+          { id: "gpt-5.6-sol", label: "GPT-5.6 Sol" },
+          { id: "gpt-5.6-luna", label: "GPT-5.6 Luna" },
+        ],
+      },
+    } satisfies typeof codex;
+    expect(selectDefaultModelSelection([claude, luna])).toEqual({
+      instanceId: "codex",
+      model: "gpt-5.6-luna",
+      effort: "high",
+    });
+  });
+
+  it("uses high effort for the Codex fallback when Luna is not in the installed catalog", () => {
+    expect(selectDefaultModelSelection([codex])).toEqual({
+      instanceId: "codex",
+      model: "codex-default",
+      effort: "high",
+    });
   });
 });

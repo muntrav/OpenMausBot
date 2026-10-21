@@ -52,10 +52,14 @@ export function useBotSettingsDerived(bot: Bot) {
   const engine = state.instances.find((instance) => instance.instanceId === bot.modelSelection.instanceId);
   // The approval level (ask / auto / full / custom) as the shared rule reads
   // it from the record — bots saved before approvalMode existed still carry
-  // only autoApprove. Full and Custom need the packaged desktop's trusted
-  // channel (SettingsPanel used the same test before the dialog replaced it).
+  // only autoApprove. Custom always needs the packaged desktop's trusted
+  // channel; self-hosted administrators may explicitly opt into remote Full
+  // access through the server's container-scoped feature flag.
   const approvalMode = approvalModeFor(bot);
-  const trustedModesAvailable = Boolean(window.ogb?.approvals && capabilities.host.packaged);
+  const trustedModesAvailable = Boolean(
+    (window.ogb?.approvals && capabilities.host.packaged) ||
+    state.config?.features?.remoteFullAccess === true,
+  );
   const canCoordinate = engine?.capabilities?.agentsMcp === true;
   const canUseConnectedApps = engine?.capabilities?.composioMcp === true;
   const canUseVps = engine?.capabilities?.computerMcp === true && engine.driverKind !== "boxAgent";

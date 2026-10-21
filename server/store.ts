@@ -227,6 +227,11 @@ export type GroupDefaultResponder =
   | { kind: "everyone" }
   | { kind: "mentions" };
 
+/** How a room crosses section boundaries, if at all. The default is the
+ * original section-only boundary. A supervised room may contain exactly one
+ * specialist section plus one explicitly named Chief of Staff supervisor. */
+export type GroupCoordinationMode = "section" | "chief-supervised";
+
 /** One independent conversation inside a user-created channel. Channel
  * membership and instructions stay on GroupRecord; transcript-bound state
  * lives here so switching tasks never moves a pin or working directory into
@@ -271,6 +276,11 @@ export interface GroupRecord {
   /** sidebar section heading this room is filed under; shares the bots'
    * namespace so one heading can hold a project's room and its people */
   section?: string;
+  /** Explicit room-level exception for a Chief supervising one specialist
+   * section. Missing/unknown values fail closed as section-only. */
+  coordinationMode?: GroupCoordinationMode;
+  /** The active Chief allowed to bridge this room's specialist section. */
+  supervisorBotId?: string;
   /** New user-created rooms start with setup pending. Null timestamps are
    * intentional: records from before room setup has existed omit both keys
    * and remain immediately usable. */
@@ -356,6 +366,10 @@ export interface TaskRecord {
    * to the bot until migration seeds their model selection. */
   modelSelection?: ModelSelection;
   approvalMode?: ApprovalMode;
+  /** false means this task follows the server default; true is an explicit
+   * task-level choice. Legacy records are migrated to true to preserve their
+   * current behavior. */
+  approvalModeOverride?: boolean;
   autoApprove?: boolean;
   alwaysAllow?: string[];
   unread?: boolean;
@@ -388,6 +402,7 @@ export interface TaskRecord {
 
 const TASK_PATCH_FIELDS = [
   "title", "projectId", "modelSelection", "approvalMode", "autoApprove", "alwaysAllow",
+  "approvalModeOverride",
   "unread", "rewound", "archivedAt", "pinnedMessageId", "resumeCursors", "lastInstanceId", "cwd",
   "routineRunId", "surface",
 ] as const satisfies readonly (keyof TaskRecord)[];
@@ -673,6 +688,9 @@ export interface BotRecord {
   /** Canonical approval level. Missing means a legacy record and resolves
    * through autoApprove (true = safe Auto, otherwise Ask). */
   approvalMode?: ApprovalMode;
+  /** false means this bot follows the server default; true is an explicit
+   * per-bot choice. Legacy records are migrated to true. */
+  approvalModeOverride?: boolean;
   /** Server-private elevation journal. Full/Custom executes as Ask until
    * Electron confirms the exact prepared reply and then activates it over
    * the utility-process channel. Any marker surviving a restart is revoked
@@ -881,6 +899,7 @@ export class Store {
   groups: GroupRecord[] = [];
   private threads = new Map<string, ThreadState>();
   private defaultSelection: () => ModelSelection;
+  private defaultApprovalMode: () => ApprovalMode;
   private listeners = new Set<(change: StoreChange) => void>();
   /** A broken team registry must not prevent loading independent chat data. */
   private registeringInitialSections = true;
@@ -888,8 +907,9 @@ export class Store {
    * that slot must not clear a concurrently running independent task. */
   private legacyActivities = new Map<string, BotActivity>();
 
-  constructor(defaultSelection: () => ModelSelection) {
+  constructor(defaultSelection: () => ModelSelection, defaultApprovalMode: () => ApprovalMode = () => "ask") {
     this.defaultSelection = defaultSelection;
+    this.defaultApprovalMode = defaultApprovalMode;
     mkdirSync(DATA_DIR, { recursive: true });
     try {
       this.bots = JSON.parse(readFileSync(BOTS_FILE, "utf8"));
@@ -952,6 +972,12 @@ export class Store {
       }
       if (b.approvalMode !== undefined && !isApprovalMode(b.approvalMode)) {
         delete b.approvalMode;
+        botsMigrated = true;
+      }
+      if (typeof b.approvalModeOverride !== "boolean") {
+        // Existing records have an established choice. Do not silently make
+        // a newly configured server default rewrite them on upgrade.
+        b.approvalModeOverride = true;
         botsMigrated = true;
       }
       // A trusted elevation is a prepare/confirm/activate commit. If the
@@ -1118,6 +1144,10 @@ export class Store {
           delete task.approvalMode;
           botsMigrated = true;
         }
+        if (typeof task.approvalModeOverride !== "boolean") {
+          task.approvalModeOverride = true;
+          botsMigrated = true;
+        }
         if (task.busy !== undefined || task.activity !== undefined) botsMigrated = true;
         task.busy = false;
         task.activity = "idle";
@@ -1264,7 +1294,7 @@ export class Store {
     );
   }
 
-  patchGroup(id: string, patch: Partial<Pick<GroupRecord, "name" | "memberIds" | "defaultResponder" | "bulletin" | "unread" | "busyBotId" | "cwd" | "pinnedMessageId" | "section" | "setupCompletedAt" | "setupSkippedAt">>): GroupRecord | null {
+  patchGroup(id: string, patch: Partial<Pick<GroupRecord, "name" | "memberIds" | "defaultResponder" | "bulletin" | "unread" | "busyBotId" | "cwd" | "pinnedMessageId" | "section" | "coordinationMode" | "supervisorBotId" | "setupCompletedAt" | "setupSkippedAt">>): GroupRecord | null {
     const group = this.group(id);
     if (!group) return null;
     if (Object.prototype.hasOwnProperty.call(patch, "section")) {
@@ -1723,6 +1753,9 @@ export class Store {
       ...(profile.mascotBody ? { mascotBody: profile.mascotBody } : {}),
       unread: false,
       modelSelection: profile.modelSelection ?? this.defaultSelection(),
+      approvalMode: this.defaultApprovalMode(),
+      autoApprove: this.defaultApprovalMode() === "auto",
+      approvalModeOverride: false,
       resumeCursors: {},
       createdAt: Date.now(),
     };
@@ -1733,6 +1766,9 @@ export class Store {
       createdAt: bot.createdAt,
       resumeCursors: {},
       modelSelection: structuredClone(bot.modelSelection),
+      approvalMode: bot.approvalMode,
+      autoApprove: bot.autoApprove,
+      approvalModeOverride: false,
       unread: false,
       activity: "idle",
       busy: false,
@@ -1781,9 +1817,9 @@ export class Store {
         next = { id: operation.botId, threadId: operation.threadId, name: operation.fields.name,
           title: "", description: "", soul: "", notifications: true, color: COLORS[nextBots.length % COLORS.length], unread: false,
           modelSelection: operation.fields.modelSelection, resumeCursors: {}, createdAt, ...operation.fields,
-          approvalMode: "ask", autoApprove: false, composio: false, approvePeerComms: false,
+          approvalMode: this.defaultApprovalMode(), autoApprove: this.defaultApprovalMode() === "auto", approvalModeOverride: false, composio: false, approvePeerComms: false,
           tasks: [{ threadId: operation.threadId, title: UNTITLED_THREAD, createdAt, resumeCursors: {},
-            modelSelection: structuredClone(operation.fields.modelSelection), approvalMode: "ask", autoApprove: false,
+            modelSelection: structuredClone(operation.fields.modelSelection), approvalMode: this.defaultApprovalMode(), autoApprove: this.defaultApprovalMode() === "auto", approvalModeOverride: false,
             unread: false, activity: "idle", busy: false }],
         };
         nextBots.unshift(next);
@@ -1873,12 +1909,15 @@ export class Store {
     if (!bot) return null;
     // Runtime revocations must become effective in memory even when disk is
     // unavailable. Profile edits use the separate atomic path below.
-    Object.assign(bot, patch);
+    const normalizedPatch = (patch.approvalMode !== undefined || patch.autoApprove !== undefined) && patch.approvalModeOverride === undefined
+      ? { ...patch, approvalModeOverride: true }
+      : patch;
+    Object.assign(bot, normalizedPatch);
     const task = this.activeTask(id);
     if (task) {
       for (const key of ["resumeCursors", "rewound", "pinnedMessageId", "unread"] as const) {
-        if (Object.prototype.hasOwnProperty.call(patch, key)) {
-          Object.assign(task, { [key]: structuredClone(patch[key]) });
+        if (Object.prototype.hasOwnProperty.call(normalizedPatch, key)) {
+          Object.assign(task, { [key]: structuredClone(normalizedPatch[key]) });
         }
       }
       bot.unread = bot.tasks!.some((candidate) => candidate.unread);
@@ -2253,6 +2292,7 @@ export class Store {
       modelSelection: structuredClone(task.modelSelection ?? bot.modelSelection),
       resumeCursors: structuredClone(task.resumeCursors),
       approvalMode: task.approvalMode ?? (task.autoApprove === undefined ? bot.approvalMode : undefined),
+      approvalModeOverride: task.approvalModeOverride ?? bot.approvalModeOverride,
       autoApprove: task.autoApprove ?? bot.autoApprove,
       alwaysAllow: structuredClone(task.alwaysAllow ?? bot.alwaysAllow),
       unread: Boolean(task.unread),
@@ -2268,6 +2308,9 @@ export class Store {
     const task = this.taskByThread(botId, threadId);
     if (!bot || !task) return null;
     if (patch.projectId !== undefined && !this.project(botId, patch.projectId)) return null;
+    if ((patch.approvalMode !== undefined || patch.autoApprove !== undefined) && patch.approvalModeOverride === undefined) {
+      patch = { ...patch, approvalModeOverride: true };
+    }
     for (const key of TASK_PATCH_FIELDS) {
       if (Object.prototype.hasOwnProperty.call(patch, key)) {
         Object.assign(task, { [key]: structuredClone(patch[key]) });
@@ -2281,6 +2324,45 @@ export class Store {
     return task;
   }
 
+  /** Apply the server default to existing records. When overwriteExisting is
+   * true this is an explicit administrator action and clears per-bot/task
+   * overrides; otherwise only records already following the global default
+   * are changed. */
+  applyApprovalDefault(mode: ApprovalMode, overwriteExisting: boolean): {
+    botsUpdated: number;
+    tasksUpdated: number;
+    botsPreserved: number;
+    tasksPreserved: number;
+  } {
+    let botsUpdated = 0;
+    let tasksUpdated = 0;
+    let botsPreserved = 0;
+    let tasksPreserved = 0;
+    for (const bot of this.bots) {
+      const updateBot = overwriteExisting || bot.approvalModeOverride !== true;
+      if (updateBot) {
+        bot.approvalMode = mode;
+        bot.autoApprove = mode === "auto";
+        bot.approvalModeOverride = false;
+        if (mode === "ask") bot.alwaysAllow = [];
+        botsUpdated++;
+      } else botsPreserved++;
+      for (const task of bot.tasks ?? []) {
+        const updateTask = overwriteExisting || task.approvalModeOverride !== true;
+        if (updateTask) {
+          task.approvalMode = mode;
+          task.autoApprove = mode === "auto";
+          task.approvalModeOverride = false;
+          if (mode === "ask") task.alwaysAllow = [];
+          tasksUpdated++;
+        } else tasksPreserved++;
+      }
+    }
+    this.saveBots();
+    for (const bot of this.bots) this.emit({ type: "bot", botId: bot.id });
+    return { botsUpdated, tasksUpdated, botsPreserved, tasksPreserved };
+  }
+
   /** Model/provider changes are one configuration transaction: never publish
    * a new provider before its confirmed approval downgrade, or change the
    * default while leaving the selected thread behind after a write failure. */
@@ -2290,7 +2372,7 @@ export class Store {
     const task = this.taskByThread(botId, threadId);
     if (!bot || !task) return null;
     const patch = { modelSelection: structuredClone(selection),
-      ...(resetApprovalToAsk ? { approvalMode: "ask" as const, autoApprove: false, alwaysAllow: [] } : {}) };
+      ...(resetApprovalToAsk ? { approvalMode: "ask" as const, autoApprove: false, approvalModeOverride: true, alwaysAllow: [] } : {}) };
     const nextTask = { ...task, ...taskPatch, ...patch,
       ...(typeof taskPatch.title === "string" ? { title: taskPatch.title.trim().slice(0, 80) || UNTITLED_THREAD } : {}) };
     // Older threads may still inherit settings. Freeze their effective
@@ -2333,8 +2415,9 @@ export class Store {
       ...(openedBy ? { openedBy: structuredClone(openedBy) } : {}),
       resumeCursors: {},
       modelSelection: structuredClone(bot.modelSelection),
-      approvalMode: approvalModeFor(bot),
-      autoApprove: Boolean(bot.autoApprove),
+      approvalMode: bot.approvalModeOverride === false ? this.defaultApprovalMode() : approvalModeFor(bot),
+      autoApprove: bot.approvalModeOverride === false ? this.defaultApprovalMode() === "auto" : Boolean(bot.autoApprove),
+      approvalModeOverride: bot.approvalModeOverride !== false,
       alwaysAllow: [...(bot.alwaysAllow ?? [])],
       unread: false,
       activity: "idle",

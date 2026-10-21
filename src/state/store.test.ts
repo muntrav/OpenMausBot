@@ -56,6 +56,12 @@ describe("composer thread approval persistence", () => {
     expect(JSON.parse(request.mock.calls[0][1].body)).toEqual({ approvalMode: "ask" });
     await expect(persistTaskApproval("bot", "thread", { approvalMode: "full", confirmFullAccess: true }, { setMode: vi.fn().mockRejectedValue(new Error("gone")) }, request)).rejects.toThrow("gone");
   });
+  it("allows confirmed remote Full for an explicitly trusted administrator session", async () => {
+    const bot = { id: "bot", approvalMode: "full" } as BotAnnouncement;
+    const request = vi.fn().mockResolvedValue({ bot });
+    await expect(persistTaskApproval("bot", "thread", { approvalMode: "full", confirmFullAccess: true }, undefined, request, true)).resolves.toBe(bot);
+    expect(JSON.parse(String(request.mock.calls[0]?.[1]?.body))).toEqual({ approvalMode: "full" });
+  });
 });
 
 describe("stream delta flushing", () => {
@@ -381,6 +387,20 @@ describe("trusted approval-mode persistence", () => {
       undefined,
     )).rejects.toThrow("packaged desktop app");
     expect(request).not.toHaveBeenCalled();
+  });
+
+  it("persists confirmed remote Full without a desktop bridge", async () => {
+    const request = vi.fn(async (_path: string, _init?: RequestInit) => ({ bot: announcement("full") }));
+    await expect(persistBotUpdate(
+      "bot-1",
+      { approvalMode: "full", confirmFullAccess: true },
+      new AbortController().signal,
+      request,
+      undefined,
+      undefined,
+      true,
+    )).resolves.toMatchObject({ approvalMode: "full" });
+    expect(JSON.parse(String(request.mock.calls[0]?.[1]?.body))).toEqual({ approvalMode: "full" });
   });
 
   it("uses the private bridge to leave Custom instead of the bot-callable HTTP API", async () => {

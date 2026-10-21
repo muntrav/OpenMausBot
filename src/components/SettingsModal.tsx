@@ -35,6 +35,70 @@ import { CompanyBackupSettings } from "./CompanyBackupSettings";
 import { cn } from "@/lib/cn";
 import { setShowThreads, useShowThreads } from "@/lib/thread-preferences";
 
+function ApprovalDefaultsCard() {
+  const { state, dispatch } = useStore();
+  const configured = state.config?.approvalDefaults;
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [message, setMessage] = useState("");
+  if (!configured) return null;
+  const remoteFull = state.config?.features?.remoteFullAccess === true;
+
+  const save = async (mode: "ask" | "edits" | "auto" | "full") => {
+    if (saving || (mode === "full" && !remoteFull)) return;
+    if (mode === "full" && !window.confirm("Enable Full Access as the default for existing and new bots? Full Access permits unattended commands and file changes inside this container.")) return;
+    setSaving(true);
+    setError("");
+    setMessage("");
+    try {
+      const result = await api("/api/approval-default", {
+        method: "PUT",
+        body: JSON.stringify({ mode, applyToExisting: true, reason: "Administrator changed the server-wide default" }),
+        signal: AbortSignal.timeout(15_000),
+      }) as { botsUpdated?: number; tasksUpdated?: number };
+      const config: ConfigStatus = await api("/api/config", { signal: AbortSignal.timeout(10_000) });
+      dispatch({ type: "configStatus", config });
+      setMessage(`Applied to ${result.botsUpdated ?? 0} bots and ${result.tasksUpdated ?? 0} threads.`);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not change the server-wide approval default");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Card title="Server-wide approval default" subtitle="Controls new bots and threads. Applying it also resets existing bot and thread overrides.">
+      <div className="flex flex-wrap items-center gap-2">
+        <select
+          value={configured.mode}
+          disabled={saving}
+          aria-label="Server-wide approval default"
+          onChange={(event) => void save(event.target.value as "ask" | "edits" | "auto" | "full")}
+          className="min-h-9 rounded-lg border border-hairline/40 bg-inset px-2.5 py-1.5 text-[13px] text-ink disabled:opacity-50"
+        >
+          <option value="ask">Ask for approval</option>
+          <option value="edits">Approve edits</option>
+          <option value="auto">Approve for me</option>
+          <option value="full" disabled={!remoteFull}>Full access{remoteFull ? "" : " (server disabled)"}</option>
+        </select>
+        <button
+          type="button"
+          disabled={saving || configured.mode === "ask"}
+          onClick={() => void save("ask")}
+          className="ui-button disabled:opacity-50"
+        >
+          Emergency revert to Ask
+        </button>
+      </div>
+      <p className="mt-3 text-[12px] leading-relaxed text-ink-secondary">
+        Explicit per-bot changes remain overrides until you choose this setting again. Full access is restricted to this container; the host and Docker daemon remain outside the boundary.
+      </p>
+      {message && <p role="status" className="mt-2 text-[13px] text-success">{message}</p>}
+      {error && <p role="alert" className="mt-2 text-[13px] text-danger">{error}</p>}
+    </Card>
+  );
+}
+
 // `labelKey`, not a label: t() reads the active pack when it is called, so a
 // label resolved here at module scope would freeze the language the app booted
 // in. The English keywords stay untranslated — they are a search index, and a
@@ -640,6 +704,7 @@ export function SettingsModal() {
                   <RoomTurnTimeoutSettings />
                 </Card>
                 <ThreadConcurrencySettings />
+                <ApprovalDefaultsCard />
                 <div>
                   {!remoteActive && <ReplayTourRow />}
                   <UpdatesRow />
