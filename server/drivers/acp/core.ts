@@ -137,6 +137,9 @@ export interface AcpSupport {
     env: Record<string, string | undefined>,
     ctx: { model?: string; requestedModel?: string; fullAuto: boolean },
   ): void;
+  /** Whether this ACP runtime accepts per-session MCP server declarations.
+   * OpenClaw ACP configures MCP at the Gateway/agent boundary instead. */
+  supportsMcpServers?: boolean;
   /** Pick the ACP authenticate methodId from initialize's advertised
    * authMethods; return null to skip the authenticate step. */
   pickAuthMethod(authMethods: Array<{ id?: string }>): string | null;
@@ -486,6 +489,9 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
         const turnId = newId();
         const cwd = turn.cwd ?? turnConfig.workspace ?? homedir();
         const env = childEnv(turnConfig);
+        // Let a generic ACP launcher derive an agent-scoped session key per
+        // OpenMausBot task without adding one driver per OpenClaw agent.
+        env.OPENMAUS_THREAD_ID = threadId;
         if (
           support.requireAuthenticationBeforeSpawn
           && !skipSubscriptionAuthForLocalInject(turn.model)
@@ -502,7 +508,7 @@ export function createAcpDriver(support: AcpSupport): ProviderDriver<AcpConfig> 
           resolvedModel !== undefined && resolvedModel !== turn.model
             ? { ...turn, model: resolvedModel }
             : turn;
-        const mcpServers = acpMcpServers(turn);
+        const mcpServers = support.supportsMcpServers === false ? [] : acpMcpServers(turn);
         let launch: { command: string; args?: string[]; env?: Record<string, string | undefined> };
         try {
           launch = support.resolveCommand

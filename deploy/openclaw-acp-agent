@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+OPENCLAW_BIN=${OPENCLAW_BIN:-/opt/openclaw/npm-global/bin/openclaw}
+if [ "${1:-}" = "--version" ]; then
+  printf '%s\n' 'openclaw-acp-agent-wrapper 1'
+  exit 0
+fi
+SESSION=${OPENMAUS_OPENCLAW_SESSION:-}
+if [ -n "${OPENMAUS_OPENCLAW_SESSION_PREFIX:-}" ] && [ -n "${OPENMAUS_THREAD_ID:-}" ]; then
+  SESSION="${OPENMAUS_OPENCLAW_SESSION_PREFIX}:${OPENMAUS_THREAD_ID}"
+fi
+: "${SESSION:?OpenClaw ACP session mapping is required}"
+exec "$OPENCLAW_BIN" acp --session "$SESSION" "$@"

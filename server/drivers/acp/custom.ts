@@ -26,6 +26,9 @@ const support: AcpSupport = {
   models: { default: "agent-default", options: [{ id: "agent-default", label: "Agent default" }] },
   defaultCli: "",
   nativeSource: "custom.acp",
+  // OpenClaw ACP rejects per-session MCP declarations; its tools are
+  // configured on the OpenClaw Gateway/agent instead.
+  supportsMcpServers: false,
   loginNote: CONFIGURE_HINT,
   // Mode-entering args ride the cli string itself ("fx acp"), so nothing
   // extra here.

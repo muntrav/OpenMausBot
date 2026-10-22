@@ -1,0 +1,36 @@
+[Unit]
+Description=OpenMausBot OpenClaw agent workspace
+After=network-online.target openclaw.service tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=openclaw
+Group=openclaw
+WorkingDirectory=/opt/openclaw/workspace/OpenMausBot
+Environment=HOME=/opt/openclaw/home
+Environment=NODE_ENV=production
+Environment=OMB_DATA_DIR=/opt/openclaw/state/openmausbot
+Environment=OMB_PORT=8799
+Environment=OPENCLAW_BIN=/opt/openclaw/npm-global/bin/openclaw
+Environment=OPENCLAW_CONFIG_PATH=/opt/openclaw/config/openclaw.json
+Environment=OPENCLAW_HOME=/opt/openclaw/home
+Environment=OPENCLAW_STATE_DIR=/opt/openclaw/state
+Environment=OPENCLAW_WORKSPACE_DIR=/opt/openclaw/workspace
+Environment=OMB_PUBLIC_URL=https://vmi3445710.tail6d938a.ts.net:8443
+ExecStartPre=/usr/bin/node /opt/openclaw/workspace/OpenMausBot/deploy/openclaw-agent-sync.mjs --apply
+ExecStartPre=+/usr/bin/tailscale serve --bg --https=8443 http://127.0.0.1:8799
+ExecStart=/usr/bin/node --experimental-strip-types /opt/openclaw/workspace/OpenMausBot/server/openmausbot.ts serve --port 8799 --data-dir /opt/openclaw/state/openmausbot --no-pair --public-url https://vmi3445710.tail6d938a.ts.net:8443 --label OpenClaw
+ExecStartPost=-/usr/bin/node /opt/openclaw/workspace/OpenMausBot/deploy/openclaw-agent-sync.mjs --sync-bots
+ExecStopPost=+/usr/bin/tailscale serve --https=8443 off
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/openclaw/state /opt/openclaw/home
+
+[Install]
+WantedBy=multi-user.target
